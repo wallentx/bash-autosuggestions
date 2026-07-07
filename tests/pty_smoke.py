@@ -12,6 +12,7 @@ import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = b"bas-test$ "
+TWO_LINE_PROMPT = b"[william@starman]\r\n:~/src/bash-autosuggestions > "
 
 
 def read_until(fd, needle, timeout=5.0):
@@ -164,9 +165,9 @@ def cursor_after_output(data, cols, start_col):
     return row, col
 
 
-def run(fd, command):
+def run(fd, command, prompt=PROMPT):
     write(fd, command.encode() + b"\n")
-    return read_until(fd, PROMPT)
+    return read_until(fd, prompt)
 
 
 def assert_output_line(output, line, context):
@@ -175,9 +176,9 @@ def assert_output_line(output, line, context):
         raise AssertionError(f"{context}: {output!r}")
 
 
-def clear_line(fd):
+def clear_line(fd, prompt=PROMPT):
     write(fd, b"\x15\n")
-    read_until(fd, PROMPT)
+    read_until(fd, prompt)
     read_available(fd, timeout=0.05)
 
 
@@ -217,6 +218,7 @@ def main():
     if pid == 0:
         os.chdir(tmpdir)
         os.environ["TERM"] = "xterm-256color"
+        os.environ.pop("NO_COLOR", None)
         os.environ["PS1"] = PROMPT.decode()
         os.environ["HISTFILE"] = os.path.join(tmpdir, "history")
         os.execlp("bash", "bash", "--noprofile", "--norc", "-i")
@@ -224,12 +226,130 @@ def main():
     try:
         read_until(fd, PROMPT)
         run(fd, f"enable -f {shlex.quote(os.path.join(ROOT, 'bash-autosuggestions.so'))} bash_autosuggestions")
+
+        builtin_help = run(fd, "bash_autosuggestions")
+        for needle in (b"Usage", b"enable", b"config", b"\x1b["):
+            if needle not in builtin_help:
+                raise AssertionError(f"builtin help omitted {needle!r}: {builtin_help!r}")
+
+        run(fd, f"source {shlex.quote(os.path.join(ROOT, 'bash-autosuggestions.bash'))}")
+
+        wrapper_help = run(fd, "bash_autosuggestions")
+        for needle in (b"Usage", b"config", b"configure", b"\x1b["):
+            if needle not in wrapper_help:
+                raise AssertionError(f"wrapper help omitted {needle!r}: {wrapper_help!r}")
+
+        wrapper_flag_help = run(fd, "bash_autosuggestions --help")
+        if b"Usage" not in wrapper_flag_help or b"config" not in wrapper_flag_help:
+            raise AssertionError(f"wrapper --help did not show usage: {wrapper_flag_help!r}")
+
+        config_help = run(fd, "bash_autosuggestions config --help")
+        for needle in (b"Usage", b"bash_autosuggestions config", b"--profile", b"\x1b["):
+            if needle not in config_help:
+                raise AssertionError(f"config help omitted {needle!r}: {config_help!r}")
+
+        profiles = run(fd, "bash_autosuggestions config --list-profiles")
+        for profile in (b"smart", b"minimal", b"fast", b"safe", b"completion"):
+            if profile not in profiles:
+                raise AssertionError(f"configure profile list omitted {profile!r}: {profiles!r}")
+
+        preview = run(fd, "bash_autosuggestions config --preview-style 'fg=cyan,underline'")
+        if b"Highlight preview" not in preview or b"\x1b[38;5;6;4m" not in preview:
+            raise AssertionError(f"style preview did not render expected ANSI preview: {preview!r}")
+
+        printed = run(fd, "bash_autosuggestions config --profile smart --print")
+        for needle in (
+            b"# >>> bash-autosuggestions >>>",
+            b"BASH_AUTOSUGGEST_USE_ASYNC=auto",
+            b"BASH_AUTOSUGGEST_STRATEGY=(match_prev_cmd completion)",
+            b"source",
+            b"# <<< bash-autosuggestions <<<",
+        ):
+            if needle not in printed:
+                raise AssertionError(f"printed configure block omitted {needle!r}: {printed!r}")
+
+        run(fd, "bash_autosuggestions config --profile smart --bashrc ./basrc-smart --yes --no-apply")
+        sourced = run(fd, "bash --noprofile --norc -c 'source ./basrc-smart; declare -p BASH_AUTOSUGGEST_STRATEGY'")
+        if b"command not found" in sourced or b"declare -a BASH_AUTOSUGGEST_STRATEGY" not in sourced:
+            raise AssertionError(f"generated strategy config did not source as an array: {sourced!r}")
+
+        run(fd, "printf '%s\n' 'source /old/bash-autosuggestions.bash' > ./basrc-standalone")
+        run(fd, "bash_autosuggestions config --profile smart --bashrc ./basrc-standalone --yes --no-apply")
+        source_count = run(fd, "grep -c 'bash-autosuggestions[.]bash' ./basrc-standalone")
+        assert_output_line(source_count, b"1", "configure should remove stale standalone source lines")
+
+        configured = run(fd, "bash_autosuggestions config --profile safe --bashrc ./basrc --yes --no-apply")
+        if b"Updated ./basrc" not in configured:
+            raise AssertionError(f"configure did not write requested bashrc: {configured!r}")
+        basrc = run(fd, "cat ./basrc")
+        for needle in (
+            b"BASH_AUTOSUGGEST_USE_ASYNC=0",
+            b"BASH_AUTOSUGGEST_BUFFER_MAX_SIZE=120",
+            b"BASH_AUTOSUGGEST_HISTORY_IGNORE=\\*password\\*",
+        ):
+            if needle not in basrc:
+                raise AssertionError(f"configure bashrc block omitted {needle!r}: {basrc!r}")
+        run(fd, "bash_autosuggestions config --profile fast --bashrc ./basrc --yes --no-apply")
+        count = run(fd, "grep -c '^# >>> bash-autosuggestions >>>' ./basrc")
+        assert_output_line(count, b"1", "configure should replace, not duplicate, managed block")
+
+        write(fd, b"bash_autosuggestions config --profile safe --bashrc ./basrc-ui --no-apply\n")
+        ui = read_until(fd, b"safe        sync mode")
+        if b"\x1b[7msafe        sync mode" not in ui:
+            raise AssertionError(f"interactive profile menu did not preselect safe: {ui!r}")
+        write(fd, b"\n")
+        read_until(fd, b"Customize This Profile?")
+        write(fd, b"\n")
+        ui = read_until(fd, b"0     synchronous")
+        if b"\x1b[7m0     synchronous" not in ui:
+            raise AssertionError(f"customize menu did not use safe profile async default: {ui!r}")
+        write(fd, b"\n" * 10)
+        read_until(fd, b"Write/update managed block")
+        write(fd, b"n\n")
+        read_until(fd, PROMPT)
+
         run(fd, "unset BASH_AUTOSUGGEST_USE_ASYNC ZSH_AUTOSUGGEST_USE_ASYNC; bash_autosuggestions enable")
-        async_default = run(fd, "case ${BASH_AUTOSUGGEST_USE_ASYNC+x} in x) echo async-default;; *) echo async-missing;; esac")
-        if b"async-missing" not in async_default:
-            raise AssertionError(f"async was enabled by default: {async_default!r}")
         run(fd, "set +o history")
         run(fd, "history -c")
+
+        run(fd, "_bash_autosuggest_strategy_async_probe() { BASH_AUTOSUGGEST_ASYNC_PROBE=$1; [[ 'probe default' == \"$1\"* ]] && suggestion='probe default'; }")
+        run(fd, "BASH_AUTOSUGGEST_STRATEGY=(async_probe)")
+
+        run(fd, "unset BASH_AUTOSUGGEST_ASYNC_PROBE")
+        write(fd, b"probe")
+        read_until(fd, b"\x1b[38;5;8m default\x1b[0m")
+        clear_line(fd)
+        output = run(fd, "case ${BASH_AUTOSUGGEST_ASYNC_PROBE+x} in x) echo probe-sync:$BASH_AUTOSUGGEST_ASYNC_PROBE;; *) echo probe-async;; esac")
+        assert_output_line(output, b"probe-async", "unset async setting did not use async by default")
+
+        run(fd, "BASH_AUTOSUGGEST_USE_ASYNC=0")
+        run(fd, "unset BASH_AUTOSUGGEST_ASYNC_PROBE")
+        write(fd, b"probe")
+        read_until(fd, b"\x1b[38;5;8m default\x1b[0m")
+        clear_line(fd)
+        output = run(fd, "case ${BASH_AUTOSUGGEST_ASYNC_PROBE+x} in x) echo probe-sync:$BASH_AUTOSUGGEST_ASYNC_PROBE;; *) echo probe-async;; esac")
+        assert_output_line(output, b"probe-sync:probe", "false async setting did not force sync")
+
+        run(fd, "BASH_AUTOSUGGEST_USE_ASYNC=auto")
+        run(fd, "unset BASH_AUTOSUGGEST_ASYNC_PROBE")
+        write(fd, b"probe")
+        read_until(fd, b"\x1b[38;5;8m default\x1b[0m")
+        clear_line(fd)
+        output = run(fd, "case ${BASH_AUTOSUGGEST_ASYNC_PROBE+x} in x) echo probe-sync:$BASH_AUTOSUGGEST_ASYNC_PROBE;; *) echo probe-async;; esac")
+        assert_output_line(output, b"probe-async", "auto did not use async with a single-line prompt")
+
+        run(fd, "PS1=$'[william@starman]\\n:~/src/bash-autosuggestions > '", prompt=TWO_LINE_PROMPT)
+        run(fd, "unset BASH_AUTOSUGGEST_ASYNC_PROBE", prompt=TWO_LINE_PROMPT)
+        write(fd, b"probe")
+        read_until(fd, b"\x1b[38;5;8m default\x1b[0m")
+        clear_line(fd, prompt=TWO_LINE_PROMPT)
+        output = run(fd, "case ${BASH_AUTOSUGGEST_ASYNC_PROBE+x} in x) echo probe-sync:$BASH_AUTOSUGGEST_ASYNC_PROBE;; *) echo probe-async;; esac", prompt=TWO_LINE_PROMPT)
+        assert_output_line(output, b"probe-sync:probe", "auto did not force sync with a multi-line prompt")
+        run(fd, "printf -v PS1 %s bas-test\\$\\ ")
+
+        run(fd, "unset -f _bash_autosuggest_strategy_async_probe")
+        run(fd, "BASH_AUTOSUGGEST_STRATEGY=history")
+        run(fd, "unset BASH_AUTOSUGGEST_USE_ASYNC ZSH_AUTOSUGGEST_USE_ASYNC BASH_AUTOSUGGEST_ASYNC_PROBE")
 
         run(fd, "history -s 'echo hello from autosuggestions'")
         write(fd, b"ec")
@@ -292,6 +412,7 @@ def main():
         assert_output_line(output, b"ps2-ctrl-c-ok",
                            "Ctrl-C did not abort a continuation prompt")
 
+        run(fd, "BASH_AUTOSUGGEST_USE_ASYNC=0")
         run(fd, "_bash_autosuggest_strategy_slow_interrupt() { sleep 3; suggestion='slow interrupt'; }")
         run(fd, "BASH_AUTOSUGGEST_STRATEGY=(slow_interrupt)")
         write(fd, b"s")
@@ -305,22 +426,22 @@ def main():
                            "shell did not recover after interrupting sync strategy")
         run(fd, "unset -f _bash_autosuggest_strategy_slow_interrupt")
         run(fd, "BASH_AUTOSUGGEST_STRATEGY=history")
+        run(fd, "unset BASH_AUTOSUGGEST_USE_ASYNC")
 
-        two_line_prompt = b"[william@starman]\r\n:~/src/bash-autosuggestions > "
         write(fd, b"PS1=$'[william@starman]\\n:~/src/bash-autosuggestions > '\n")
-        read_until(fd, two_line_prompt)
+        read_until(fd, TWO_LINE_PROMPT)
         write(fd, b"history -c\n")
-        read_until(fd, two_line_prompt)
+        read_until(fd, TWO_LINE_PROMPT)
         write(fd, b"history -s 'echo hello'\n")
-        read_until(fd, two_line_prompt)
+        read_until(fd, TWO_LINE_PROMPT)
         for ch in b"echo":
             write(fd, bytes([ch]))
             chunk = read_available(fd, timeout=0.25)
             if b"[william@starman]" in chunk:
                 raise AssertionError(f"multi-line prompt was redrawn after {bytes([ch])!r}: {chunk!r}")
         write(fd, b"\x15\n")
-        read_until(fd, two_line_prompt)
-        write(fd, b"PS1='bas-test$ '\n")
+        read_until(fd, TWO_LINE_PROMPT)
+        write(fd, b"printf -v PS1 %s bas-test\\$\\ \n")
         read_until(fd, PROMPT)
 
         run(fd, "history -s 'git checkout main'")

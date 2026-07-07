@@ -136,8 +136,9 @@ static struct bas_binding bas_default_bindings[] = {
 };
 
 static const char *bas_long_doc[] = {
-    "bash_autosuggestions [enable|disable|toggle|clear|fetch|bind|status]\n",
+    "bash_autosuggestions [command]\n",
     "Display zsh-autosuggestions-style ghost text in Bash using Readline.\n",
+    "Run bash_autosuggestions with no arguments for help.\n",
     (char *)0,
 };
 
@@ -514,8 +515,78 @@ static char *bas_fetch_suggestion_for(const char *prefix) {
   return suggestion;
 }
 
+static int bas_string_equals_trimmed(const char *value, const char *word) {
+  if (!value || !word) {
+    return 0;
+  }
+
+  while (value && isspace((unsigned char)*value)) {
+    value++;
+  }
+
+  const char *end = value + strlen(value);
+  while (end > value && isspace((unsigned char)end[-1])) {
+    end--;
+  }
+
+  size_t len = (size_t)(end - value);
+  if (len != strlen(word)) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < len; i++) {
+    if (tolower((unsigned char)value[i]) != tolower((unsigned char)word[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int bas_async_value_is_false(const char *value) {
+  return bas_string_equals_trimmed(value, "0") ||
+         bas_string_equals_trimmed(value, "no") ||
+         bas_string_equals_trimmed(value, "false") ||
+         bas_string_equals_trimmed(value, "off");
+}
+
+static int bas_prompt_has_visible_newline(void) {
+  const char *prompt = rl_display_prompt ? rl_display_prompt : rl_prompt;
+  int hidden = 0;
+
+  for (size_t i = 0; prompt && prompt[i]; i++) {
+    unsigned char c = (unsigned char)prompt[i];
+    if (c == '\001') {
+      hidden = 1;
+      continue;
+    }
+    if (c == '\002') {
+      hidden = 0;
+      continue;
+    }
+    if (hidden) {
+      continue;
+    }
+    if (c == '\n' || c == '\r') {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 static int bas_async_enabled(void) {
-  return bas_var2("BASH_AUTOSUGGEST_USE_ASYNC", "ZSH_AUTOSUGGEST_USE_ASYNC") != NULL;
+  const char *value = bas_var2("BASH_AUTOSUGGEST_USE_ASYNC",
+                               "ZSH_AUTOSUGGEST_USE_ASYNC");
+  if (!value) {
+    return 1;
+  }
+  if (bas_async_value_is_false(value)) {
+    return 0;
+  }
+  if (bas_string_equals_trimmed(value, "auto")) {
+    return !bas_prompt_has_visible_newline();
+  }
+  return 1;
 }
 
 static void bas_async_reset_state(void) {
@@ -780,6 +851,7 @@ static int bas_update_suggestion(void) {
   if (bas_async_enabled()) {
     return bas_async_request_current();
   }
+  bas_async_reset_state();
   return bas_fetch_and_set_suggestion();
 }
 
@@ -1154,12 +1226,12 @@ static void bas_clear_suggestion(void) {
 }
 
 static void bas_update_suggestion_for_accept(void) {
-  if (!bas_enabled || bas_async_enabled() || !rl_line_buffer || rl_end <= 0 ||
-      !bas_at_accept_position()) {
+  if (!bas_enabled || !rl_line_buffer || rl_end <= 0 || !bas_at_accept_position()) {
     return;
   }
 
   if (bas_line_state_changed() || !bas_suggestion || !bas_suffix || !*bas_suffix) {
+    bas_async_reset_state();
     bas_fetch_and_set_suggestion();
   }
 }
@@ -1365,6 +1437,7 @@ static int bas_fetch_command(int count, int key) {
   if (bas_async_enabled()) {
     bas_async_request_current();
   } else {
+    bas_async_reset_state();
     bas_fetch_and_set_suggestion();
   }
   bas_redisplay();
@@ -1567,9 +1640,49 @@ static const char *bas_word(WORD_LIST *list) {
   return list->word->word;
 }
 
+static int bas_help_uses_color(void) {
+  const char *term = getenv("TERM");
+  return isatty(STDOUT_FILENO) && getenv("NO_COLOR") == NULL &&
+         (!term || strcmp(term, "dumb") != 0);
+}
+
+static int bas_print_help(void) {
+  int color = bas_help_uses_color();
+  const char *reset = color ? "\033[0m" : "";
+  const char *title = color ? "\033[1;38;5;45m" : "";
+  const char *heading = color ? "\033[1;38;5;39m" : "";
+  const char *cmd = color ? "\033[1;38;5;220m" : "";
+  const char *dim = color ? "\033[2m" : "";
+
+  printf("\n%sbash_autosuggestions%s\n", title, reset);
+  printf("  %sGhost-text command suggestions for interactive Bash.%s\n\n", dim, reset);
+  printf("%sUsage%s\n", heading, reset);
+  printf("  %sbash_autosuggestions%s [command]\n\n", cmd, reset);
+  printf("%sCommands%s\n", heading, reset);
+  printf("  %senable%s       enable autosuggestions in this shell\n", cmd, reset);
+  printf("  %sdisable%s      disable autosuggestions in this shell\n", cmd, reset);
+  printf("  %stoggle%s       toggle autosuggestions on or off\n", cmd, reset);
+  printf("  %sclear%s        clear the visible suggestion\n", cmd, reset);
+  printf("  %sfetch%s        refresh the suggestion for the current line\n", cmd, reset);
+  printf("  %sbind%s         rebind configured Readline keys\n", cmd, reset);
+  printf("  %sstatus%s       show whether the builtin is installed and enabled\n", cmd, reset);
+  printf("  %suninstall%s    remove hooks and key bindings from this shell\n", cmd, reset);
+  printf("  %sconfig%s       open the guided configuration UI when sourced through the loader\n",
+         cmd, reset);
+  printf("  %sconfigure%s    alias for config\n\n", cmd, reset);
+  printf("%sOptions%s\n", heading, reset);
+  printf("  %s-h, --help%s   show this help\n", cmd, reset);
+  return EXECUTION_SUCCESS;
+}
+
 int bash_autosuggestions_builtin(WORD_LIST *list) {
   const char *cmd = bas_word(list);
-  if (!cmd || strcmp(cmd, "enable") == 0) {
+  if (!cmd || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0 ||
+      strcmp(cmd, "help") == 0) {
+    return bas_print_help();
+  }
+
+  if (strcmp(cmd, "enable") == 0) {
     bas_install();
     bas_enabled = 1;
     return EXECUTION_SUCCESS;
@@ -1613,9 +1726,8 @@ int bash_autosuggestions_builtin(WORD_LIST *list) {
     return EXECUTION_SUCCESS;
   }
 
-  fprintf(stderr,
-          "bash_autosuggestions: usage: bash_autosuggestions "
-          "[enable|disable|toggle|clear|fetch|bind|status|uninstall]\n");
+  fprintf(stderr, "bash_autosuggestions: unknown command: %s\n", cmd);
+  bas_print_help();
   return EX_USAGE;
 }
 
@@ -1624,7 +1736,7 @@ struct builtin bash_autosuggestions_struct = {
     bash_autosuggestions_builtin,
     BUILTIN_ENABLED,
     (char *const *)bas_long_doc,
-    "bash_autosuggestions [enable|disable|toggle|clear|fetch|bind|status|uninstall]",
+    "bash_autosuggestions [command]",
     0,
 };
 

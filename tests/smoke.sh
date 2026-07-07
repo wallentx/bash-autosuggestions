@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-bash -ic '
+bash --noprofile --norc -ic '
   enable -f ./bash-autosuggestions.so bash_autosuggestions
   bash_autosuggestions enable
   bash_autosuggestions status

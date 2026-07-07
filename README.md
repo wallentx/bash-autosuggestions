@@ -8,7 +8,38 @@ are drawn as muted trailing text after the cursor, like zsh's `POSTDISPLAY`.
 ## Build
 
 ```sh
-make
+make all
+```
+
+Run `make` or `make help` to see the available build, test, install, and
+startup-file helper targets.
+
+## Install
+
+```sh
+make install
+```
+
+This installs the loadable builtin and loader script under:
+
+```sh
+/usr/local/lib/bash-autosuggestions/
+```
+
+It then prints the `~/.bashrc` line needed to load the plugin and, when run
+interactively, asks whether to add/update that line for you.
+When run through `sudo`, the installer targets the invoking user's `~/.bashrc`
+instead of `/root/.bashrc`.
+After installation, source your bash startup file or open a new terminal. The
+`bash_autosuggestions` command is available after the loader is sourced.
+
+Useful install options:
+
+```sh
+make install PREFIX="$HOME/.local"
+make install BASHRC_UPDATE=yes
+make install BASHRC_UPDATE=no
+make bashrc-snippet
 ```
 
 ## Use
@@ -23,6 +54,51 @@ Or load manually:
 enable -f /path/to/bash-autosuggestions.so bash_autosuggestions
 bash_autosuggestions enable
 ```
+
+## Configure
+
+After sourcing the loader, run the guided configurator:
+
+```sh
+bash_autosuggestions config
+```
+
+`bash_autosuggestions` with no arguments prints the command help. `config`
+opens the guided configurator; `configure` is kept as an alias. The
+configurator presents a cursor-driven menu of profiles, explains each setting,
+previews highlight styles against sample command text, applies the selected
+settings to the current shell, and can write/update a managed block in
+`~/.bashrc`.
+
+Useful non-interactive forms:
+
+```sh
+bash_autosuggestions config --list-profiles
+bash_autosuggestions config --preview-style 'fg=#777777,bold'
+bash_autosuggestions config --profile smart --print
+bash_autosuggestions config --profile safe --dry-run
+bash_autosuggestions config --profile smart --yes
+```
+
+Profiles:
+
+- `smart`: `match_prev_cmd completion`, `async=auto`, word-at-a-time accept on
+  `Alt-F`
+- `minimal`: history only, `async=auto`
+- `fast`: history only, `async=1`
+- `safe`: history only, `async=0`, conservative size/ignore defaults
+- `completion`: aggressive `match_prev_cmd history completion`
+
+The configurator-generated `~/.bashrc` block is bounded by:
+
+```sh
+# >>> bash-autosuggestions >>>
+source /usr/local/lib/bash-autosuggestions/bash-autosuggestions.bash
+# <<< bash-autosuggestions <<<
+```
+
+Rerunning `bash_autosuggestions config` replaces that block rather than
+appending duplicates.
 
 ## Behavior
 
@@ -77,7 +153,7 @@ ZSH_AUTOSUGGEST_STRATEGY=(history completion)
 BASH_AUTOSUGGEST_BUFFER_MAX_SIZE=
 BASH_AUTOSUGGEST_HISTORY_IGNORE=
 BASH_AUTOSUGGEST_COMPLETION_IGNORE=
-BASH_AUTOSUGGEST_USE_ASYNC=1
+BASH_AUTOSUGGEST_USE_ASYNC=auto
 BASH_AUTOSUGGEST_ACCEPT_KEYSEQS=
 BASH_AUTOSUGGEST_EXECUTE_KEYSEQS=
 BASH_AUTOSUGGEST_CLEAR_KEYSEQS=
@@ -87,9 +163,21 @@ BASH_AUTOSUGGEST_PARTIAL_ACCEPT_KEYSEQS=
 The matching `ZSH_AUTOSUGGEST_*` names work as aliases for the same settings.
 For keyseq settings, use Readline key sequence syntax such as `\C-b`, then run
 `bash_autosuggestions bind` to apply the mapping.
-Async fetching is opt-in. Set `BASH_AUTOSUGGEST_USE_ASYNC=1` or
-`ZSH_AUTOSUGGEST_USE_ASYNC=1` before loading or enabling the builtin to fetch
-suggestions in a worker process.
+
+Async fetching is enabled by default when neither `BASH_AUTOSUGGEST_USE_ASYNC`
+nor `ZSH_AUTOSUGGEST_USE_ASYNC` is set. It keeps the prompt responsive while
+slower strategies, custom functions, or completion lookups run in a worker
+process. Set the value at runtime:
+
+- unset: async enabled
+- `1`, `yes`, `true`, `on`, or any other non-empty non-false value: async
+  enabled
+- `0`, `no`, `false`, or `off`: async disabled
+- `auto`: async enabled unless the expanded Readline prompt is visibly
+  multi-line
+
+Use `0` for fully synchronous fetching, or `auto` when a multi-line prompt has
+redraw artifacts with async suggestion updates.
 
 Strategies are tried left to right:
 
