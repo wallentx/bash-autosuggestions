@@ -77,7 +77,7 @@ ZSH_AUTOSUGGEST_STRATEGY=(history completion)
 BASH_AUTOSUGGEST_BUFFER_MAX_SIZE=
 BASH_AUTOSUGGEST_HISTORY_IGNORE=
 BASH_AUTOSUGGEST_COMPLETION_IGNORE=
-BASH_AUTOSUGGEST_USE_ASYNC=
+BASH_AUTOSUGGEST_USE_ASYNC=1
 BASH_AUTOSUGGEST_ACCEPT_KEYSEQS=
 BASH_AUTOSUGGEST_EXECUTE_KEYSEQS=
 BASH_AUTOSUGGEST_CLEAR_KEYSEQS=
@@ -87,9 +87,9 @@ BASH_AUTOSUGGEST_PARTIAL_ACCEPT_KEYSEQS=
 The matching `ZSH_AUTOSUGGEST_*` names work as aliases for the same settings.
 For keyseq settings, use Readline key sequence syntax such as `\C-b`, then run
 `bash_autosuggestions bind` to apply the mapping.
-Async fetching is enabled by default, matching zsh-autosuggestions on modern
-zsh. Unset `BASH_AUTOSUGGEST_USE_ASYNC` or `ZSH_AUTOSUGGEST_USE_ASYNC` after
-loading to fetch synchronously.
+Async fetching is opt-in. Set `BASH_AUTOSUGGEST_USE_ASYNC=1` or
+`ZSH_AUTOSUGGEST_USE_ASYNC=1` before loading or enabling the builtin to fetch
+suggestions in a worker process.
 
 Strategies are tried left to right:
 

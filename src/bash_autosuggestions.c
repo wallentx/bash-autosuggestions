@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #ifndef EXECUTION_SUCCESS
@@ -35,6 +36,7 @@
 static int bas_installed;
 static int bas_enabled = 1;
 static int bas_in_redisplay;
+static int bas_drawn_rows = -1;
 
 static char *bas_suggestion;
 static char *bas_suffix;
@@ -47,12 +49,13 @@ static char *bas_async_prefix;
 static char *bas_async_output;
 static size_t bas_async_output_len;
 
-static rl_voidfunc_t *bas_original_redisplay;
 static rl_hook_func_t *bas_original_event_hook;
-static rl_hook_func_t *bas_original_pre_input_hook;
-
+static rl_vintfunc_t *bas_original_prep_term_function;
+static int bas_original_keyboard_timeout = -1;
+static int bas_in_prep_terminal;
 static int bas_accept(int count, int key);
 static int bas_execute(int count, int key);
+static int bas_interrupt(int count, int key);
 static int bas_clear_command(int count, int key);
 static int bas_fetch_command(int count, int key);
 static int bas_enable_command(int count, int key);
@@ -69,6 +72,41 @@ static int bas_bracketed_paste_begin(int count, int key);
 static void bas_clear_suggestion(void);
 static int bas_fetch_and_set_suggestion(void);
 
+static int bas_input_fd(void) {
+  FILE *in = rl_instream ? rl_instream : stdin;
+  return fileno(in);
+}
+
+static int bas_set_input_isig(int enabled, struct termios *saved) {
+  int fd = bas_input_fd();
+  if (fd < 0) {
+    return 0;
+  }
+
+  struct termios tio;
+  if (tcgetattr(fd, &tio) != 0) {
+    return 0;
+  }
+
+  if (saved) {
+    *saved = tio;
+  }
+
+  if (enabled) {
+    tio.c_lflag |= ISIG;
+  } else {
+    tio.c_lflag &= ~ISIG;
+  }
+  return tcsetattr(fd, TCSANOW, &tio) == 0;
+}
+
+static void bas_restore_input_termios(const struct termios *saved) {
+  int fd = bas_input_fd();
+  if (fd >= 0 && saved) {
+    tcsetattr(fd, TCSANOW, saved);
+  }
+}
+
 struct bas_binding {
   const char *keyseq;
   rl_command_func_t *replacement;
@@ -77,6 +115,9 @@ struct bas_binding {
 };
 
 static struct bas_binding bas_default_bindings[] = {
+    {"\003", bas_interrupt, rl_abort, NULL},                 /* C-c */
+    {"\003", bas_interrupt, rl_abort, "vi-insert"},
+    {"\003", bas_interrupt, rl_abort, "vi-movement"},
     {"\006", bas_forward_char, rl_forward_char, NULL},       /* C-f */
     {"\033[C", bas_forward_char, rl_forward_char, NULL},     /* right */
     {"\033OC", bas_forward_char, rl_forward_char, NULL},     /* app right */
@@ -474,8 +515,7 @@ static char *bas_fetch_suggestion_for(const char *prefix) {
 }
 
 static int bas_async_enabled(void) {
-  return find_variable("BASH_AUTOSUGGEST_USE_ASYNC") != NULL ||
-         find_variable("ZSH_AUTOSUGGEST_USE_ASYNC") != NULL;
+  return bas_var2("BASH_AUTOSUGGEST_USE_ASYNC", "ZSH_AUTOSUGGEST_USE_ASYNC") != NULL;
 }
 
 static void bas_async_reset_state(void) {
@@ -705,7 +745,12 @@ static int bas_fetch_and_set_suggestion(void) {
     return 0;
   }
 
+  struct termios saved_tio;
+  int saved_terminal = bas_set_input_isig(1, &saved_tio);
   char *suggestion = bas_fetch_suggestion_for(prefix);
+  if (saved_terminal) {
+    bas_restore_input_termios(&saved_tio);
+  }
   if (!suggestion || !bas_prefix_matches(suggestion, prefix)) {
     free(prefix);
     free(suggestion);
@@ -882,23 +927,177 @@ static int bas_columns_to_end(void) {
   return cols;
 }
 
-static void bas_draw_suggestion(void) {
-  if (!bas_suffix_is_drawable(bas_suffix) || rl_point > rl_end) {
+static int bas_screen_columns(void) {
+  int rows = 0;
+  int cols = 0;
+  rl_get_screen_size(&rows, &cols);
+  return cols > 0 ? cols : 80;
+}
+
+static void bas_advance_cell(int *col, int screen_cols, unsigned char c) {
+  if (c == '\n' || c == '\r') {
+    *col = 0;
     return;
   }
 
-  FILE *out = rl_outstream ? rl_outstream : stdout;
-  char style[160];
-  bas_style_sequence(style, sizeof(style));
-  fputs("\033[s", out);
+  if (c == '\b') {
+    if (*col > 0) {
+      (*col)--;
+    }
+    return;
+  }
+
+  if (c == '\t') {
+    int width = 8 - (*col % 8);
+    *col += width;
+  } else if (c >= 0x20 && c != 0x7f) {
+    (*col)++;
+  }
+
+  if (screen_cols > 0) {
+    *col %= screen_cols;
+  }
+}
+
+static int bas_prompt_column(void) {
+  const char *prompt = rl_display_prompt ? rl_display_prompt : rl_prompt;
+  int col = 0;
+  int hidden = 0;
+  int screen_cols = bas_screen_columns();
+
+  for (size_t i = 0; prompt && prompt[i]; i++) {
+    unsigned char c = (unsigned char)prompt[i];
+    if (c == '\001') {
+      hidden = 1;
+      continue;
+    }
+    if (c == '\002') {
+      hidden = 0;
+      continue;
+    }
+    if (hidden) {
+      continue;
+    }
+    if (c == '\033' && prompt[i + 1] == '[') {
+      i += 2;
+      while (prompt[i] && !((unsigned char)prompt[i] >= 0x40 &&
+                            (unsigned char)prompt[i] <= 0x7e)) {
+        i++;
+      }
+      continue;
+    }
+    bas_advance_cell(&col, screen_cols, c);
+  }
+
+  return col;
+}
+
+static int bas_line_end_column(void) {
+  int col = bas_prompt_column();
+  int screen_cols = bas_screen_columns();
+
+  for (int i = 0; rl_line_buffer && i < rl_end; i++) {
+    bas_advance_cell(&col, screen_cols, (unsigned char)rl_line_buffer[i]);
+  }
+
+  return col;
+}
+
+static int bas_suffix_rows(const char *suffix) {
+  int col = bas_line_end_column();
+  int rows = 0;
+  int screen_cols = bas_screen_columns();
+
+  for (size_t i = 0; suffix && suffix[i]; i++) {
+    int before = col;
+    unsigned char c = (unsigned char)suffix[i];
+    bas_advance_cell(&col, screen_cols, c);
+    if (c == '\n' || c == '\r' || (screen_cols > 0 && before + 1 >= screen_cols)) {
+      rows++;
+    }
+  }
+
+  return rows;
+}
+
+static int bas_suffix_columns(const char *suffix) {
+  int cols = 0;
+  for (size_t i = 0; suffix && suffix[i]; i++) {
+    unsigned char c = (unsigned char)suffix[i];
+    if (c == '\n' || c == '\r') {
+      return -1;
+    }
+    if (c == '\b') {
+      if (cols > 0) {
+        cols--;
+      }
+    } else if (c == '\t') {
+      cols += 8 - (cols % 8);
+    } else if (c >= 0x20 && c != 0x7f) {
+      cols++;
+    }
+  }
+  return cols;
+}
+
+static int bas_move_to_suggestion_start(FILE *out) {
   int offset = bas_columns_to_end();
   if (offset > 0) {
     fprintf(out, "\033[%dC", offset);
   }
-  fputs(style, out);
-  fputs(bas_suffix, out);
-  fputs("\033[0m", out);
+  return offset;
+}
+
+static void bas_clear_drawn_suggestion(FILE *out) {
+  if (bas_drawn_rows < 0) {
+    return;
+  }
+
+  fputs("\033[s", out);
+  bas_move_to_suggestion_start(out);
+  for (int row = 0; row <= bas_drawn_rows; row++) {
+    fputs("\033[K", out);
+    if (row < bas_drawn_rows) {
+      fputs("\033[B\r", out);
+    }
+  }
   fputs("\033[u", out);
+  bas_drawn_rows = -1;
+}
+
+static void bas_draw_suggestion(void) {
+  int drawable = bas_suffix_is_drawable(bas_suffix) && rl_point <= rl_end;
+  if (!drawable && bas_drawn_rows < 0) {
+    return;
+  }
+
+  FILE *out = rl_outstream ? rl_outstream : stdout;
+  bas_clear_drawn_suggestion(out);
+  if (!drawable) {
+    fflush(out);
+    return;
+  }
+
+  char style[160];
+  bas_style_sequence(style, sizeof(style));
+  bas_drawn_rows = bas_suffix_rows(bas_suffix);
+  int suffix_cols = bas_drawn_rows == 0 ? bas_suffix_columns(bas_suffix) : -1;
+  if (suffix_cols >= 0) {
+    int offset = bas_move_to_suggestion_start(out);
+    fputs(style, out);
+    fputs(bas_suffix, out);
+    fputs("\033[0m", out);
+    if (suffix_cols + offset > 0) {
+      fprintf(out, "\033[%dD", suffix_cols + offset);
+    }
+  } else {
+    fputs("\033[s", out);
+    bas_move_to_suggestion_start(out);
+    fputs(style, out);
+    fputs(bas_suffix, out);
+    fputs("\033[0m", out);
+    fputs("\033[u", out);
+  }
   fflush(out);
 }
 
@@ -908,50 +1107,45 @@ static void bas_redisplay(void) {
   }
 
   bas_in_redisplay = 1;
-  if (bas_original_redisplay && bas_original_redisplay != bas_redisplay) {
-    bas_original_redisplay();
-  } else {
-    rl_voidfunc_t *saved = rl_redisplay_function;
-    rl_redisplay_function = NULL;
-    rl_redisplay();
-    rl_redisplay_function = saved;
+  if (bas_line_state_changed()) {
+    bas_update_suggestion();
   }
+  rl_redisplay();
   bas_draw_suggestion();
   bas_in_redisplay = 0;
 }
 
 static int bas_event_hook(void) {
   int changed = 0;
+  int state_changed = 0;
+  if (rl_pending_signal()) {
+    bas_drawn_rows = -1;
+    bas_async_reset_state();
+    bas_clear_suggestion();
+    rl_check_signals();
+    return 0;
+  }
   if (bas_original_event_hook) {
     changed |= bas_original_event_hook();
   }
 
   changed |= bas_async_poll();
 
-  if (bas_line_state_changed()) {
+  state_changed = bas_line_state_changed();
+  if (state_changed) {
     changed |= bas_update_suggestion();
   }
 
-  if (changed) {
-    rl_forced_update_display();
+  if (changed || state_changed) {
+    bas_draw_suggestion();
   }
-
-  return 0;
-}
-
-static int bas_pre_input_hook(void) {
-  if (bas_original_pre_input_hook) {
-    bas_original_pre_input_hook();
-  }
-  bas_line_state_changed();
-  bas_update_suggestion();
   return 0;
 }
 
 static void bas_force_refresh(void) {
   bas_line_state_changed();
   bas_update_suggestion();
-  rl_forced_update_display();
+  bas_redisplay();
 }
 
 static void bas_clear_suggestion(void) {
@@ -959,7 +1153,19 @@ static void bas_clear_suggestion(void) {
   bas_free(&bas_suffix);
 }
 
+static void bas_update_suggestion_for_accept(void) {
+  if (!bas_enabled || bas_async_enabled() || !rl_line_buffer || rl_end <= 0 ||
+      !bas_at_accept_position()) {
+    return;
+  }
+
+  if (bas_line_state_changed() || !bas_suggestion || !bas_suffix || !*bas_suffix) {
+    bas_fetch_and_set_suggestion();
+  }
+}
+
 static int bas_insert_suffix(void) {
+  bas_update_suggestion_for_accept();
   if (!bas_suggestion || !bas_suffix || !*bas_suffix || !bas_at_accept_position()) {
     return 0;
   }
@@ -974,6 +1180,7 @@ static int bas_insert_suffix(void) {
 }
 
 static int bas_partial_accept_with(rl_command_func_t *move_func, int count, int key) {
+  bas_update_suggestion_for_accept();
   if (!bas_suggestion || !bas_suffix || !*bas_suffix || !bas_at_accept_position()) {
     return 0;
   }
@@ -1108,10 +1315,6 @@ static void bas_bind_configured_keyseqs(void) {
 }
 
 static void bas_set_default_async(void) {
-  if (!find_variable("BASH_AUTOSUGGEST_USE_ASYNC") &&
-      !find_variable("ZSH_AUTOSUGGEST_USE_ASYNC")) {
-    bind_variable("BASH_AUTOSUGGEST_USE_ASYNC", "", 0);
-  }
 }
 
 static int bas_call_or_partial(rl_command_func_t *move_func, int count, int key) {
@@ -1151,7 +1354,7 @@ static int bas_clear_command(int count, int key) {
   (void)count;
   (void)key;
   bas_clear_suggestion();
-  rl_forced_update_display();
+  bas_redisplay();
   return 0;
 }
 
@@ -1164,7 +1367,7 @@ static int bas_fetch_command(int count, int key) {
   } else {
     bas_fetch_and_set_suggestion();
   }
-  rl_forced_update_display();
+  bas_redisplay();
   return 0;
 }
 
@@ -1181,7 +1384,7 @@ static int bas_disable_command(int count, int key) {
   (void)key;
   bas_enabled = 0;
   bas_clear_suggestion();
-  rl_forced_update_display();
+  bas_redisplay();
   return 0;
 }
 
@@ -1193,7 +1396,7 @@ static int bas_toggle_command(int count, int key) {
     bas_force_refresh();
   } else {
     bas_clear_suggestion();
-    rl_forced_update_display();
+    bas_redisplay();
   }
   return 0;
 }
@@ -1259,6 +1462,41 @@ static void bas_restore_defaults(void) {
   }
 }
 
+static int bas_interrupt(int count, int key) {
+  (void)count;
+  (void)key;
+
+  bas_async_reset_state();
+  bas_clear_suggestion();
+  bas_drawn_rows = -1;
+  bas_last_point = -1;
+  bas_last_end = -1;
+  bas_free(&bas_last_line);
+
+  rl_replace_line("", 0);
+  rl_point = 0;
+  rl_done = 1;
+  kill(getpid(), SIGINT);
+  return 0;
+}
+
+static void bas_prep_terminal(int meta_flag) {
+  if (bas_in_prep_terminal) {
+    return;
+  }
+
+  bas_in_prep_terminal = 1;
+  if (bas_original_prep_term_function &&
+      bas_original_prep_term_function != bas_prep_terminal) {
+    bas_original_prep_term_function(meta_flag);
+  } else {
+    rl_prep_terminal(meta_flag);
+  }
+
+  bas_set_input_isig(0, NULL);
+  bas_in_prep_terminal = 0;
+}
+
 static int bas_install(void) {
   if (bas_installed) {
     return 1;
@@ -1269,9 +1507,10 @@ static int bas_install(void) {
   bas_add_readline_functions();
   bas_bind_defaults();
 
-  if (rl_redisplay_function != bas_redisplay) {
-    bas_original_redisplay = rl_redisplay_function;
-    rl_redisplay_function = bas_redisplay;
+  if (bas_original_keyboard_timeout < 0) {
+    bas_original_keyboard_timeout = rl_set_keyboard_input_timeout(10000);
+  } else {
+    rl_set_keyboard_input_timeout(10000);
   }
 
   if (rl_event_hook != bas_event_hook) {
@@ -1279,9 +1518,9 @@ static int bas_install(void) {
     rl_event_hook = bas_event_hook;
   }
 
-  if (rl_pre_input_hook != bas_pre_input_hook) {
-    bas_original_pre_input_hook = rl_pre_input_hook;
-    rl_pre_input_hook = bas_pre_input_hook;
+  if (rl_prep_term_function != bas_prep_terminal) {
+    bas_original_prep_term_function = rl_prep_term_function;
+    rl_prep_term_function = bas_prep_terminal;
   }
 
   bas_installed = 1;
@@ -1294,16 +1533,17 @@ static void bas_uninstall(void) {
     return;
   }
 
-  if (rl_redisplay_function == bas_redisplay) {
-    rl_redisplay_function = bas_original_redisplay;
-  }
   if (rl_event_hook == bas_event_hook) {
     rl_event_hook = bas_original_event_hook;
   }
-  if (rl_pre_input_hook == bas_pre_input_hook) {
-    rl_pre_input_hook = bas_original_pre_input_hook;
+  if (rl_prep_term_function == bas_prep_terminal) {
+    rl_prep_term_function = bas_original_prep_term_function;
+    bas_original_prep_term_function = NULL;
   }
-
+  if (bas_original_keyboard_timeout >= 0) {
+    rl_set_keyboard_input_timeout(bas_original_keyboard_timeout);
+    bas_original_keyboard_timeout = -1;
+  }
   bas_restore_defaults();
   bas_async_reset_state();
   bas_clear_suggestion();

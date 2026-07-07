@@ -112,9 +112,67 @@ def cursor_after_wrapped_suggestion(data, cols, start_col):
     return saved, before_restore, after_restore, max_row_after_save
 
 
+def cursor_after_output(data, cols, start_col):
+    row = 0
+    col = start_col
+    saved = None
+    i = 0
+    while i < len(data):
+        if data.startswith(b"\x1b[s", i):
+            saved = (row, col)
+            i += 3
+            continue
+        if data.startswith(b"\x1b[u", i):
+            if saved is not None:
+                row, col = saved
+            i += 3
+            continue
+        if data[i:i + 2] == b"\x1b[":
+            j = i + 2
+            while j < len(data) and not (0x40 <= data[j] <= 0x7e):
+                j += 1
+            if j >= len(data):
+                break
+            params = data[i + 2:j].decode(errors="ignore")
+            final = chr(data[j])
+            first = params.split(";")[0] if params else ""
+            amount = int(first) if first.isdigit() else 1
+            if final == "C":
+                col += amount
+            elif final == "D":
+                col = max(0, col - amount)
+            elif final == "G":
+                col = max(0, amount - 1)
+            elif final in ("H", "f"):
+                row = 0
+                col = 0
+            i = j + 1
+            continue
+        byte = data[i]
+        if byte == 8:
+            col = max(0, col - 1)
+        elif byte == 13:
+            col = 0
+        elif byte == 10:
+            row += 1
+        elif byte >= 0x20 and byte != 0x7f:
+            col += 1
+            if col >= cols:
+                row += 1
+                col = 0
+        i += 1
+    return row, col
+
+
 def run(fd, command):
     write(fd, command.encode() + b"\n")
     return read_until(fd, PROMPT)
+
+
+def assert_output_line(output, line, context):
+    needles = (b"\r" + line + b"\r\n", b"\n" + line + b"\r\n")
+    if not output.startswith(line + b"\r\n") and not any(needle in output for needle in needles):
+        raise AssertionError(f"{context}: {output!r}")
 
 
 def clear_line(fd):
@@ -166,10 +224,10 @@ def main():
     try:
         read_until(fd, PROMPT)
         run(fd, f"enable -f {shlex.quote(os.path.join(ROOT, 'bash-autosuggestions.so'))} bash_autosuggestions")
-        run(fd, "bash_autosuggestions enable")
+        run(fd, "unset BASH_AUTOSUGGEST_USE_ASYNC ZSH_AUTOSUGGEST_USE_ASYNC; bash_autosuggestions enable")
         async_default = run(fd, "case ${BASH_AUTOSUGGEST_USE_ASYNC+x} in x) echo async-default;; *) echo async-missing;; esac")
-        if b"async-default" not in async_default:
-            raise AssertionError(f"async was not enabled by default: {async_default!r}")
+        if b"async-missing" not in async_default:
+            raise AssertionError(f"async was enabled by default: {async_default!r}")
         run(fd, "set +o history")
         run(fd, "history -c")
 
@@ -180,11 +238,90 @@ def main():
             raise AssertionError(f"suggestion was not rendered with fg=8 style: {rendered!r}")
 
         write(fd, b"\x1b[C\n")
-        output = read_until(fd, b"hello from autosuggestions")
-        if b"echo hello from autosuggestions" not in output:
-            raise AssertionError(f"right arrow did not accept full suggestion: {output!r}")
-        if PROMPT not in output:
-            read_until(fd, PROMPT)
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"hello from autosuggestions",
+                           "right arrow did not accept full suggestion")
+
+        run(fd, "history -c")
+        run(fd, "history -s 'echo queued accept'")
+        write(fd, b"ec\x1b[C\n")
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"queued accept",
+                           "queued prefix plus accept key did not accept suggestion")
+
+        run(fd, "history -c")
+        run(fd, "history -s 'echo middlecursor'")
+        write(fd, b"echo mid")
+        read_until(fd, b"\x1b[38;5;8mdlecursor\x1b[0m")
+        read_available(fd, timeout=0.05)
+        cursor_start = len(PROMPT) + len("echo mid")
+        write(fd, b"\x1b[D")
+        moved_left = read_available(fd, timeout=0.5)
+        row, col = cursor_after_output(moved_left, cols=80, start_col=cursor_start)
+        if (row, col) != (0, cursor_start - 1):
+            raise AssertionError(
+                f"drawing from the middle left cursor at {(row, col)}, "
+                f"expected {(0, cursor_start - 1)}: {moved_left!r}"
+            )
+        clear_line(fd)
+
+        write(fd, b"abc")
+        cancel_line(fd)
+        output = run(fd, "printf 'plain-ctrl-c-ok\\n'")
+        assert_output_line(output, b"plain-ctrl-c-ok", "plain Ctrl-C corrupted the next command")
+        if b"abcprintf" in output or b"bcprintf" in output or b"command not found" in output:
+            raise AssertionError(f"plain Ctrl-C left stale input in the buffer: {output!r}")
+
+        run(fd, "history -c")
+        run(fd, "history -s 'echo visible-ctrl-c'")
+        write(fd, b"e")
+        read_until(fd, b"\x1b[38;5;8mcho visible-ctrl-c\x1b[0m")
+        cancel_line(fd)
+        output = run(fd, "printf 'visible-cancel-ok\\n'")
+        assert_output_line(output, b"visible-cancel-ok",
+                           "visible-suggestion Ctrl-C corrupted the next command")
+        if b"cho visible-ctrl-c" in output or b"eprintf" in output or b"command not found" in output:
+            raise AssertionError(f"visible-suggestion Ctrl-C left stale input: {output!r}")
+
+        write(fd, b"PS2='cont> '\n")
+        read_until(fd, PROMPT)
+        write(fd, b"echo \"unterminated\n")
+        read_until(fd, b"cont> ")
+        cancel_line(fd)
+        output = run(fd, "printf 'ps2-ctrl-c-ok\\n'")
+        assert_output_line(output, b"ps2-ctrl-c-ok",
+                           "Ctrl-C did not abort a continuation prompt")
+
+        run(fd, "_bash_autosuggest_strategy_slow_interrupt() { sleep 3; suggestion='slow interrupt'; }")
+        run(fd, "BASH_AUTOSUGGEST_STRATEGY=(slow_interrupt)")
+        write(fd, b"s")
+        time.sleep(0.2)
+        write(fd, b"\x03")
+        interrupted = read_until(fd, PROMPT, timeout=2.0)
+        if b"slow interrupt" in interrupted:
+            raise AssertionError(f"sync strategy was not interrupted promptly: {interrupted!r}")
+        output = run(fd, "printf 'sync-interrupt-ok\\n'")
+        assert_output_line(output, b"sync-interrupt-ok",
+                           "shell did not recover after interrupting sync strategy")
+        run(fd, "unset -f _bash_autosuggest_strategy_slow_interrupt")
+        run(fd, "BASH_AUTOSUGGEST_STRATEGY=history")
+
+        two_line_prompt = b"[william@starman]\r\n:~/src/bash-autosuggestions > "
+        write(fd, b"PS1=$'[william@starman]\\n:~/src/bash-autosuggestions > '\n")
+        read_until(fd, two_line_prompt)
+        write(fd, b"history -c\n")
+        read_until(fd, two_line_prompt)
+        write(fd, b"history -s 'echo hello'\n")
+        read_until(fd, two_line_prompt)
+        for ch in b"echo":
+            write(fd, bytes([ch]))
+            chunk = read_available(fd, timeout=0.25)
+            if b"[william@starman]" in chunk:
+                raise AssertionError(f"multi-line prompt was redrawn after {bytes([ch])!r}: {chunk!r}")
+        write(fd, b"\x15\n")
+        read_until(fd, two_line_prompt)
+        write(fd, b"PS1='bas-test$ '\n")
+        read_until(fd, PROMPT)
 
         run(fd, "history -s 'git checkout main'")
         write(fd, b"git ")
@@ -304,9 +441,9 @@ def main():
         run(fd, "unset ZSH_AUTOSUGGEST_STRATEGY")
 
         run(fd, "BASH_AUTOSUGGEST_STRATEGY=(completion history)")
-        run(fd, "history -s 'zz array fallback'")
-        write(fd, b"zz")
-        read_until(fd, b"\x1b[38;5;8m array fallback\x1b[0m")
+        run(fd, "history -s 'basarrayfallback history result'")
+        write(fd, b"basarrayfallback")
+        read_until(fd, b"\x1b[38;5;8m history result\x1b[0m")
         clear_line(fd)
 
         run(fd, "BASH_AUTOSUGGEST_USE_ASYNC=1")
@@ -331,7 +468,7 @@ def main():
         run(fd, "history -s 'echo bar'")
         run(fd, "history -s 'echo baz'")
         write(fd, b"\x1b[A\x1b[A\x1b[A")
-        read_until(fd, b"echo foo")
+        read_until(fd, b"foo")
         clear_line(fd)
 
         run(fd, "history -c")
@@ -339,8 +476,8 @@ def main():
         write(fd, b"e")
         read_until(fd, b"\x1b[38;5;8mcho async-interrupt\x1b[0m")
         cancel_line(fd)
-        write(fd, b"echo after-interrupt\n")
-        output = read_until(fd, b"after-interrupt")
+        output = run(fd, "printf 'after-interrupt\\n'")
+        assert_output_line(output, b"after-interrupt", "command after Ctrl-C did not run cleanly")
         if b"async-interrupt" in output:
             raise AssertionError(f"async suggestion survived interrupt: {output!r}")
         run(fd, "unset BASH_AUTOSUGGEST_USE_ASYNC")
@@ -392,6 +529,7 @@ def main():
         ignored_completion = read_available(fd, timeout=0.5)
         if b"\x1b[38;5;8m" in ignored_completion:
             raise AssertionError(f"completion ignore pattern was not respected: {ignored_completion!r}")
+        clear_line(fd)
         run(fd, "unset BASH_AUTOSUGGEST_COMPLETION_IGNORE")
         reset_session(fd)
 
@@ -400,7 +538,7 @@ def main():
         write(fd, b"echo")
         read_until(fd, b"\x1b[38;5;8m hello\x1b[0m")
         write(fd, b"\x02")
-        disabled = read_until(fd, b"echo")
+        disabled = read_available(fd, timeout=0.5)
         if b"\x1b[38;5;8m hello\x1b[0m" in disabled:
             raise AssertionError(f"disable did not clear suggestion: {disabled!r}")
         write(fd, b" h")
@@ -444,11 +582,9 @@ def main():
         write(fd, b"echo")
         read_until(fd, b"\x1b[38;5;8m accept-widget\x1b[0m")
         write(fd, b"\x02\n")
-        output = read_until(fd, b"accept-widget")
-        if b"echo accept-widget" not in output:
-            raise AssertionError(f"autosuggest-accept did not accept buffer before newline: {output!r}")
-        if PROMPT not in output:
-            read_until(fd, PROMPT)
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"accept-widget",
+                           "autosuggest-accept did not accept buffer before newline")
         reset_session(fd)
 
         run(fd, "bind '\"\\C-b\": autosuggest-execute'")
@@ -456,11 +592,9 @@ def main():
         write(fd, b"echo")
         read_until(fd, b"\x1b[38;5;8m execute-widget\x1b[0m")
         write(fd, b"\x02")
-        output = read_until(fd, b"execute-widget")
-        if b"echo execute-widget" not in output:
-            raise AssertionError(f"autosuggest-execute did not accept and execute: {output!r}")
-        if PROMPT not in output:
-            read_until(fd, PROMPT)
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"execute-widget",
+                           "autosuggest-execute did not accept and execute")
         reset_session(fd)
 
         run(fd, "bind '\"\\C-b\": autosuggest-clear'")
@@ -497,11 +631,9 @@ def main():
         write(fd, b"echo")
         read_until(fd, b"\x1b[38;5;8m configured-accept\x1b[0m")
         write(fd, b"\x02\n")
-        output = read_until(fd, b"configured-accept")
-        if b"echo configured-accept" not in output:
-            raise AssertionError(f"configured accept keyseq did not accept: {output!r}")
-        if PROMPT not in output:
-            read_until(fd, PROMPT)
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"configured-accept",
+                           "configured accept keyseq did not accept")
         reset_session(fd)
 
         run(fd, "BASH_AUTOSUGGEST_EXECUTE_KEYSEQS='\\C-b'")
@@ -510,11 +642,9 @@ def main():
         write(fd, b"echo")
         read_until(fd, b"\x1b[38;5;8m configured-execute\x1b[0m")
         write(fd, b"\x02")
-        output = read_until(fd, b"configured-execute")
-        if b"echo configured-execute" not in output:
-            raise AssertionError(f"configured execute keyseq did not execute: {output!r}")
-        if PROMPT not in output:
-            read_until(fd, PROMPT)
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"configured-execute",
+                           "configured execute keyseq did not execute")
         reset_session(fd)
 
         run(fd, "BASH_AUTOSUGGEST_CLEAR_KEYSEQS='\\C-g'")
@@ -619,23 +749,30 @@ def main():
         read_until(fd, b"\x1b[38;5;8mbar foo\x1b[0m")
         clear_line(fd)
 
+        run(fd, "foobarbaz() { printf 'vi-end-word-ok\\n'; }")
         run(fd, "history -c")
         run(fd, "history -s 'foobar foo'")
         write(fd, b"foo")
         read_until(fd, b"\x1b[38;5;8mbar foo\x1b[0m")
         write(fd, b"\x1bea")
-        write(fd, b"baz")
-        read_until(fd, b"foobarbaz")
-        clear_line(fd)
+        read_until(fd, b"\x1b[38;5;8m foo\x1b[0m")
+        write(fd, b"baz\n")
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"vi-end-word-ok",
+                           "vi end-word accept/edit did not submit expected buffer")
+        run(fd, "unset -f foobarbaz")
 
+        run(fd, "foobar() { printf 'vi-word:%s\\n' \"$*\"; }")
         run(fd, "history -c")
         run(fd, "history -s 'foobar foo'")
         write(fd, b"foo")
         read_until(fd, b"\x1b[38;5;8mbar foo\x1b[0m")
         write(fd, b"\x1bwa")
-        write(fd, b"az")
-        read_until(fd, b"foobar faz")
-        clear_line(fd)
+        read_until(fd, b"\x1b[38;5;8moo\x1b[0m")
+        write(fd, b"az\n")
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"vi-word:faz",
+                           "vi next-word accept/edit did not submit expected buffer")
 
         run(fd, "history -c")
         run(fd, "history -s 'foobar foo'")
@@ -643,9 +780,11 @@ def main():
         read_until(fd, b"\x1b[38;5;8mbar foo\x1b[0m")
         write(fd, b"\x1bf")
         write(fd, b"oa")
-        write(fd, b"b")
-        read_until(fd, b"foobar fob")
-        clear_line(fd)
+        write(fd, b"b\n")
+        output = read_until(fd, PROMPT)
+        assert_output_line(output, b"vi-word:fob",
+                           "vi find-char accept/edit did not submit expected buffer")
+        run(fd, "unset -f foobar")
 
         write(fd, b"echo foo")
         write(fd, b"\x1bdlaX")
