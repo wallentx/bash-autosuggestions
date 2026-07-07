@@ -1,0 +1,5 @@
+.codegraph/
+bash-autosuggestions.so
+*.o
+*.dSYM/
+__pycache__/
