@@ -20,6 +20,9 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#include <wchar.h>
+
+extern int wcwidth(wchar_t wc);
 
 #ifndef EXECUTION_SUCCESS
 #define EXECUTION_SUCCESS 0
@@ -1006,29 +1009,70 @@ static int bas_screen_columns(void) {
   return cols > 0 ? cols : 80;
 }
 
-static void bas_advance_cell(int *col, int screen_cols, unsigned char c) {
+static int bas_wcwidth_or_zero(wchar_t wc) {
+  int width = wcwidth(wc);
+  return width > 0 ? width : 0;
+}
+
+static size_t bas_char_cells(const char *s, size_t remaining, int *cells) {
+  *cells = 0;
+  if (!s || remaining == 0 || !*s) {
+    return 0;
+  }
+
+  unsigned char c = (unsigned char)s[0];
+  if (c < 0x80) {
+    if (c >= 0x20 && c != 0x7f) {
+      *cells = 1;
+    }
+    return 1;
+  }
+
+  mbstate_t state;
+  memset(&state, 0, sizeof(state));
+  wchar_t wc;
+  size_t used = mbrtowc(&wc, s, remaining, &state);
+  if (used == (size_t)-1 || used == (size_t)-2 || used == 0) {
+    *cells = 1;
+    return 1;
+  }
+
+  *cells = bas_wcwidth_or_zero(wc);
+  return used;
+}
+
+static int bas_advance_cells(int *col, int screen_cols, int cells) {
+  int rows = 0;
+  while (cells-- > 0) {
+    (*col)++;
+    if (screen_cols > 0 && *col >= screen_cols) {
+      *col = 0;
+      rows++;
+    }
+  }
+  return rows;
+}
+
+static int bas_advance_cell(int *col, int screen_cols, unsigned char c) {
   if (c == '\n' || c == '\r') {
     *col = 0;
-    return;
+    return 1;
   }
 
   if (c == '\b') {
     if (*col > 0) {
       (*col)--;
     }
-    return;
+    return 0;
   }
 
   if (c == '\t') {
     int width = 8 - (*col % 8);
-    *col += width;
+    return bas_advance_cells(col, screen_cols, width);
   } else if (c >= 0x20 && c != 0x7f) {
-    (*col)++;
+    return bas_advance_cells(col, screen_cols, 1);
   }
-
-  if (screen_cols > 0) {
-    *col %= screen_cols;
-  }
+  return 0;
 }
 
 static int bas_prompt_column(void) {
@@ -1036,18 +1080,22 @@ static int bas_prompt_column(void) {
   int col = 0;
   int hidden = 0;
   int screen_cols = bas_screen_columns();
+  size_t prompt_len = prompt ? strlen(prompt) : 0;
 
-  for (size_t i = 0; prompt && prompt[i]; i++) {
+  for (size_t i = 0; prompt && i < prompt_len;) {
     unsigned char c = (unsigned char)prompt[i];
     if (c == '\001') {
       hidden = 1;
+      i++;
       continue;
     }
     if (c == '\002') {
       hidden = 0;
+      i++;
       continue;
     }
     if (hidden) {
+      i++;
       continue;
     }
     if (c == '\033' && prompt[i + 1] == '[') {
@@ -1056,9 +1104,23 @@ static int bas_prompt_column(void) {
                             (unsigned char)prompt[i] <= 0x7e)) {
         i++;
       }
+      if (prompt[i]) {
+        i++;
+      }
       continue;
     }
-    bas_advance_cell(&col, screen_cols, c);
+    if (c == '\n' || c == '\r' || c == '\b' || c == '\t') {
+      bas_advance_cell(&col, screen_cols, c);
+      i++;
+      continue;
+    }
+    int cells = 0;
+    size_t used = bas_char_cells(prompt + i, prompt_len - i, &cells);
+    if (used == 0) {
+      break;
+    }
+    bas_advance_cells(&col, screen_cols, cells);
+    i += used;
   }
 
   return col;
@@ -1068,8 +1130,20 @@ static int bas_line_end_column(void) {
   int col = bas_prompt_column();
   int screen_cols = bas_screen_columns();
 
-  for (int i = 0; rl_line_buffer && i < rl_end; i++) {
-    bas_advance_cell(&col, screen_cols, (unsigned char)rl_line_buffer[i]);
+  for (int i = 0; rl_line_buffer && i < rl_end;) {
+    unsigned char c = (unsigned char)rl_line_buffer[i];
+    if (c == '\n' || c == '\r' || c == '\b' || c == '\t') {
+      bas_advance_cell(&col, screen_cols, c);
+      i++;
+      continue;
+    }
+    int cells = 0;
+    size_t used = bas_char_cells(rl_line_buffer + i, (size_t)(rl_end - i), &cells);
+    if (used == 0) {
+      break;
+    }
+    bas_advance_cells(&col, screen_cols, cells);
+    i += (int)used;
   }
 
   return col;
@@ -1079,14 +1153,22 @@ static int bas_suffix_rows(const char *suffix) {
   int col = bas_line_end_column();
   int rows = 0;
   int screen_cols = bas_screen_columns();
+  size_t suffix_len = suffix ? strlen(suffix) : 0;
 
-  for (size_t i = 0; suffix && suffix[i]; i++) {
-    int before = col;
+  for (size_t i = 0; suffix && i < suffix_len;) {
     unsigned char c = (unsigned char)suffix[i];
-    bas_advance_cell(&col, screen_cols, c);
-    if (c == '\n' || c == '\r' || (screen_cols > 0 && before + 1 >= screen_cols)) {
-      rows++;
+    if (c == '\n' || c == '\r' || c == '\b' || c == '\t') {
+      rows += bas_advance_cell(&col, screen_cols, c);
+      i++;
+      continue;
     }
+    int cells = 0;
+    size_t used = bas_char_cells(suffix + i, suffix_len - i, &cells);
+    if (used == 0) {
+      break;
+    }
+    rows += bas_advance_cells(&col, screen_cols, cells);
+    i += used;
   }
 
   return rows;
@@ -1094,7 +1176,8 @@ static int bas_suffix_rows(const char *suffix) {
 
 static int bas_suffix_columns(const char *suffix) {
   int cols = 0;
-  for (size_t i = 0; suffix && suffix[i]; i++) {
+  size_t suffix_len = suffix ? strlen(suffix) : 0;
+  for (size_t i = 0; suffix && i < suffix_len;) {
     unsigned char c = (unsigned char)suffix[i];
     if (c == '\n' || c == '\r') {
       return -1;
@@ -1103,10 +1186,18 @@ static int bas_suffix_columns(const char *suffix) {
       if (cols > 0) {
         cols--;
       }
+      i++;
     } else if (c == '\t') {
       cols += 8 - (cols % 8);
-    } else if (c >= 0x20 && c != 0x7f) {
-      cols++;
+      i++;
+    } else {
+      int cells = 0;
+      size_t used = bas_char_cells(suffix + i, suffix_len - i, &cells);
+      if (used == 0) {
+        break;
+      }
+      cols += cells;
+      i += used;
     }
   }
   return cols;

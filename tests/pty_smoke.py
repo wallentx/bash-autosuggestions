@@ -8,11 +8,13 @@ import struct
 import termios
 import tempfile
 import time
+import unicodedata
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROMPT = b"bas-test$ "
 TWO_LINE_PROMPT = b"[william@starman]\r\n:~/src/bash-autosuggestions > "
+UNICODE_WRAP_PROMPT = "⌜william@brickroad:~/src/bash-autosuggestions⌟ main » ".encode()
 
 
 def read_until(fd, needle, timeout=5.0):
@@ -165,6 +167,102 @@ def cursor_after_output(data, cols, start_col):
     return row, col
 
 
+class TerminalScreen:
+    def __init__(self, rows=12, cols=80):
+        self.rows = rows
+        self.cols = cols
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self.row = 0
+        self.col = 0
+        self.saved = (0, 0)
+
+    @staticmethod
+    def char_width(ch):
+        if unicodedata.combining(ch):
+            return 0
+        if unicodedata.east_asian_width(ch) in ("F", "W"):
+            return 2
+        return 1
+
+    def put_char(self, ch):
+        for idx in range(self.char_width(ch)):
+            if self.row >= self.rows:
+                self.grid.append([" "] * self.cols)
+                self.rows += 1
+            self.grid[self.row][self.col] = ch if idx == 0 else " "
+            self.col += 1
+            if self.col >= self.cols:
+                self.col = 0
+                self.row += 1
+
+    def feed(self, data):
+        i = 0
+        while i < len(data):
+            byte = data[i]
+            if byte == 0x1b:
+                if data.startswith(b"\x1b[s", i):
+                    self.saved = (self.row, self.col)
+                    i += 3
+                    continue
+                if data.startswith(b"\x1b[u", i):
+                    self.row, self.col = self.saved
+                    i += 3
+                    continue
+                if data[i:i + 2] == b"\x1b[":
+                    j = i + 2
+                    while j < len(data) and not (0x40 <= data[j] <= 0x7e):
+                        j += 1
+                    if j >= len(data):
+                        break
+                    params = data[i + 2:j].decode(errors="ignore")
+                    final = chr(data[j])
+                    first = params.split(";")[0] if params else ""
+                    amount = int(first) if first.isdigit() else 1
+                    if final == "K":
+                        for col in range(self.col, self.cols):
+                            self.grid[self.row][col] = " "
+                    elif final == "B":
+                        self.row = min(self.rows - 1, self.row + amount)
+                    elif final == "A":
+                        self.row = max(0, self.row - amount)
+                    elif final == "C":
+                        self.col = min(self.cols - 1, self.col + amount)
+                    elif final == "D":
+                        self.col = max(0, self.col - amount)
+                    elif final == "G":
+                        self.col = max(0, min(self.cols - 1, amount - 1))
+                    elif final in ("H", "f"):
+                        self.row = 0
+                        self.col = 0
+                    i = j + 1
+                    continue
+                i += 1
+                continue
+            if byte == 13:
+                self.col = 0
+            elif byte == 10:
+                self.row += 1
+            elif byte == 8:
+                self.col = max(0, self.col - 1)
+            elif byte >= 0x20 and byte != 0x7f:
+                for size in range(1, 5):
+                    try:
+                        ch = data[i:i + size].decode()
+                    except UnicodeDecodeError:
+                        continue
+                    self.put_char(ch)
+                    i += size
+                    break
+                else:
+                    self.put_char("?")
+                    i += 1
+                continue
+            i += 1
+
+    def lines(self):
+        return ["".join(row).rstrip() for row in self.grid]
+
+
 def run(fd, command, prompt=PROMPT):
     write(fd, command.encode() + b"\n")
     return read_until(fd, prompt)
@@ -219,6 +317,8 @@ def main():
         os.chdir(tmpdir)
         os.environ["TERM"] = "xterm-256color"
         os.environ.pop("NO_COLOR", None)
+        os.environ.pop("HISTCONTROL", None)
+        os.environ.pop("HISTIGNORE", None)
         os.environ["PS1"] = PROMPT.decode()
         os.environ["HISTFILE"] = os.path.join(tmpdir, "history")
         os.execlp("bash", "bash", "--noprofile", "--norc", "-i")
@@ -859,6 +959,39 @@ def main():
             raise AssertionError(
                 f"wrapped suggestion restored cursor to {after_restore}, expected {saved}: {wrapped!r}"
             )
+        set_pty_size(fd, 24, 80)
+        reset_session(fd)
+
+        set_pty_size(fd, 8, 44)
+        unicode_prompt = b"\r\n" + UNICODE_WRAP_PROMPT
+        write(fd, b"PS1=$'\\n\xe2\x8c\x9cwilliam@brickroad:~/src/bash-autosuggestions\xe2\x8c\x9f main \xc2\xbb '\n")
+        read_until(fd, unicode_prompt)
+        run(fd, "BASH_AUTOSUGGEST_USE_ASYNC=0", prompt=unicode_prompt)
+        run(fd, "history -c", prompt=unicode_prompt)
+        full_command = b"sudo pacman -S python-pytz python-pynetbox"
+        typed_command = b"sudo pacman -S python-pytz pyth"
+        run(fd, f"history -s {shlex.quote(full_command.decode())}", prompt=unicode_prompt)
+        read_available(fd, timeout=0.05)
+        wrapped_prompt_output = b""
+        for ch in typed_command:
+            write(fd, bytes([ch]))
+            wrapped_prompt_output += read_available(fd, timeout=0.08)
+        wrapped_prompt_output += read_available(fd, timeout=0.5)
+
+        actual = TerminalScreen(rows=8, cols=44)
+        actual.feed(unicode_prompt)
+        actual.feed(wrapped_prompt_output)
+        expected = TerminalScreen(rows=8, cols=44)
+        expected.feed(unicode_prompt)
+        expected.feed(full_command)
+        if actual.lines()[:5] != expected.lines()[:5]:
+            raise AssertionError(
+                "wrapped unicode prompt left stale suggestion text: "
+                f"actual={actual.lines()[:5]!r} expected={expected.lines()[:5]!r} "
+                f"output={wrapped_prompt_output!r}"
+            )
+        clear_line(fd, prompt=unicode_prompt)
+        run(fd, "printf -v PS1 %s bas-test\\$\\ ")
         set_pty_size(fd, 24, 80)
         reset_session(fd)
 
