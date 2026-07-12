@@ -1174,35 +1174,6 @@ static int bas_suffix_rows(const char *suffix) {
   return rows;
 }
 
-static int bas_suffix_columns(const char *suffix) {
-  int cols = 0;
-  size_t suffix_len = suffix ? strlen(suffix) : 0;
-  for (size_t i = 0; suffix && i < suffix_len;) {
-    unsigned char c = (unsigned char)suffix[i];
-    if (c == '\n' || c == '\r') {
-      return -1;
-    }
-    if (c == '\b') {
-      if (cols > 0) {
-        cols--;
-      }
-      i++;
-    } else if (c == '\t') {
-      cols += 8 - (cols % 8);
-      i++;
-    } else {
-      int cells = 0;
-      size_t used = bas_char_cells(suffix + i, suffix_len - i, &cells);
-      if (used == 0) {
-        break;
-      }
-      cols += cells;
-      i += used;
-    }
-  }
-  return cols;
-}
-
 static int bas_move_to_suggestion_start(FILE *out) {
   int offset = bas_columns_to_end();
   if (offset > 0) {
@@ -1244,23 +1215,12 @@ static void bas_draw_suggestion(void) {
   char style[160];
   bas_style_sequence(style, sizeof(style));
   bas_drawn_rows = bas_suffix_rows(bas_suffix);
-  int suffix_cols = bas_drawn_rows == 0 ? bas_suffix_columns(bas_suffix) : -1;
-  if (suffix_cols >= 0) {
-    int offset = bas_move_to_suggestion_start(out);
-    fputs(style, out);
-    fputs(bas_suffix, out);
-    fputs("\033[0m", out);
-    if (suffix_cols + offset > 0) {
-      fprintf(out, "\033[%dD", suffix_cols + offset);
-    }
-  } else {
-    fputs("\033[s", out);
-    bas_move_to_suggestion_start(out);
-    fputs(style, out);
-    fputs(bas_suffix, out);
-    fputs("\033[0m", out);
-    fputs("\033[u", out);
-  }
+  fputs("\033[s", out);
+  bas_move_to_suggestion_start(out);
+  fputs(style, out);
+  fputs(bas_suffix, out);
+  fputs("\033[0m", out);
+  fputs("\033[u", out);
   fflush(out);
 }
 
