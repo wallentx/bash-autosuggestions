@@ -58,6 +58,7 @@ static int bas_original_keyboard_timeout = -1;
 static int bas_in_prep_terminal;
 static int bas_accept(int count, int key);
 static int bas_execute(int count, int key);
+static int bas_newline(int count, int key);
 static int bas_interrupt(int count, int key);
 static int bas_clear_command(int count, int key);
 static int bas_fetch_command(int count, int key);
@@ -118,6 +119,12 @@ struct bas_binding {
 };
 
 static struct bas_binding bas_default_bindings[] = {
+    {"\r", bas_newline, rl_newline, NULL},
+    {"\n", bas_newline, rl_newline, NULL},
+    {"\r", bas_newline, rl_newline, "vi-insert"},
+    {"\n", bas_newline, rl_newline, "vi-insert"},
+    {"\r", bas_newline, rl_newline, "vi-movement"},
+    {"\n", bas_newline, rl_newline, "vi-movement"},
     {"\003", bas_interrupt, rl_abort, NULL},                 /* C-c */
     {"\003", bas_interrupt, rl_abort, "vi-insert"},
     {"\003", bas_interrupt, rl_abort, "vi-movement"},
@@ -1471,6 +1478,14 @@ static int bas_execute(int count, int key) {
   (void)count;
   bas_insert_suffix();
   return rl_newline(1, key);
+}
+
+static int bas_newline(int count, int key) {
+  FILE *out = rl_outstream ? rl_outstream : stdout;
+  bas_clear_drawn_suggestion(out);
+  bas_clear_suggestion();
+  fflush(out);
+  return rl_newline(count, key);
 }
 
 static int bas_clear_command(int count, int key) {

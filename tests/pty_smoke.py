@@ -798,6 +798,16 @@ def main():
         read_until(fd, b"\x1b[38;5;8morld\x1b[0m")
         reset_session(fd)
 
+        run(fd, "history -s 'echo enter-clear-ghost'")
+        write(fd, b"echo enter")
+        read_until(fd, b"\x1b[38;5;8m-clear-ghost\x1b[0m")
+        write(fd, b"\n")
+        output = read_until(fd, PROMPT)
+        if b"\x1b[s\x1b[K\x1b[u" not in output:
+            raise AssertionError(f"Enter did not erase visible suggestion before submitting: {output!r}")
+        assert_output_line(output, b"enter", "Enter changed the typed command")
+        reset_session(fd)
+
         run(fd, "bind '\"\\C-b\": autosuggest-accept'")
         run(fd, "history -s 'echo accept-widget'")
         write(fd, b"echo")
