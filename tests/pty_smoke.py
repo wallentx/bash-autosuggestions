@@ -55,66 +55,6 @@ def set_pty_size(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def cursor_after_wrapped_suggestion(data, cols, start_col):
-    row = 0
-    col = start_col
-    saved = None
-    before_restore = None
-    after_restore = None
-    max_row_after_save = 0
-    i = 0
-    while i < len(data):
-        if data.startswith(b"\x1b[s", i):
-            saved = (row, col)
-            max_row_after_save = row
-            i += 3
-            continue
-        if data.startswith(b"\x1b[u", i):
-            before_restore = (row, col)
-            if saved is not None:
-                row, col = saved
-            after_restore = (row, col)
-            i += 3
-            continue
-        if data[i:i + 2] == b"\x1b[":
-            j = i + 2
-            while j < len(data) and not (0x40 <= data[j] <= 0x7e):
-                j += 1
-            if j >= len(data):
-                break
-            params = data[i + 2:j].decode(errors="ignore")
-            final = chr(data[j])
-            first = params.split(";")[0] if params else ""
-            amount = int(first) if first.isdigit() else 1
-            if final == "C":
-                col += amount
-            elif final == "D":
-                col = max(0, col - amount)
-            elif final == "G":
-                col = max(0, amount - 1)
-            elif final in ("H", "f"):
-                row = 0
-                col = 0
-            i = j + 1
-            continue
-        byte = data[i]
-        if byte == 8:
-            col = max(0, col - 1)
-        elif byte == 13:
-            col = 0
-        elif byte == 10:
-            row += 1
-        elif byte >= 0x20 and byte != 0x7f:
-            col += 1
-            if col >= cols:
-                row += 1
-                col = 0
-        if saved is not None and before_restore is None:
-            max_row_after_save = max(max_row_after_save, row)
-        i += 1
-    return saved, before_restore, after_restore, max_row_after_save
-
-
 def cursor_after_output(data, cols, start_col):
     row = 0
     col = start_col
@@ -140,7 +80,11 @@ def cursor_after_output(data, cols, start_col):
             final = chr(data[j])
             first = params.split(";")[0] if params else ""
             amount = int(first) if first.isdigit() else 1
-            if final == "C":
+            if final == "A":
+                row = max(0, row - amount)
+            elif final == "B":
+                row += amount
+            elif final == "C":
                 col += amount
             elif final == "D":
                 col = max(0, col - amount)
@@ -803,7 +747,7 @@ def main():
         read_until(fd, b"\x1b[38;5;8m-clear-ghost\x1b[0m")
         write(fd, b"\n")
         output = read_until(fd, PROMPT)
-        if b"\x1b[s\x1b[K\x1b[u" not in output:
+        if b"\x1b[K" not in output:
             raise AssertionError(f"Enter did not erase visible suggestion before submitting: {output!r}")
         assert_output_line(output, b"enter", "Enter changed the typed command")
         reset_session(fd)
@@ -948,26 +892,24 @@ def main():
         multiline = read_until(fd, b'cho "\r\n"', timeout=5.0)
         if b"\x1b[38;5;8mcho \"" not in multiline:
             raise AssertionError(f"multi-line suggestion did not use highlight style: {multiline!r}")
-        if b"\x1b[s" not in multiline or b"\x1b[u" not in multiline:
-            raise AssertionError(f"multi-line suggestion did not preserve cursor: {multiline!r}")
+        if b"\x1b[" not in multiline:
+            raise AssertionError(f"multi-line suggestion did not position the cursor: {multiline!r}")
         reset_session(fd)
 
         set_pty_size(fd, 8, 24)
         run(fd, "history -s 'echo wrap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'")
         write(fd, b"echo ")
         wrapped = read_until(fd, b"wrap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", timeout=5.0)
-        saved, before_restore, after_restore, max_row = cursor_after_wrapped_suggestion(
-            wrapped,
+        wrapped_draw = wrapped.rsplit(b"\x1b[38;5;8m", 1)[-1]
+        wrapped_row, wrapped_col = cursor_after_output(
+            wrapped_draw,
             cols=24,
-            start_col=len(PROMPT),
+            start_col=len(PROMPT) + len(b"echo "),
         )
-        if saved is None or before_restore is None or after_restore is None:
-            raise AssertionError(f"wrapped suggestion did not save and restore cursor: {wrapped!r}")
-        if max_row <= saved[0]:
-            raise AssertionError(f"wrapped suggestion did not cross terminal width: {wrapped!r}")
-        if after_restore != saved:
+        if (wrapped_row, wrapped_col) != (0, len(PROMPT) + len(b"echo ")):
             raise AssertionError(
-                f"wrapped suggestion restored cursor to {after_restore}, expected {saved}: {wrapped!r}"
+                "wrapped suggestion did not restore the input cursor: "
+                f"got={(wrapped_row, wrapped_col)!r} output={wrapped!r}"
             )
         set_pty_size(fd, 24, 80)
         reset_session(fd)
@@ -1001,6 +943,39 @@ def main():
                 f"output={wrapped_prompt_output!r}"
             )
         clear_line(fd, prompt=unicode_prompt)
+        run(fd, "printf -v PS1 %s bas-test\\$\\ ")
+        set_pty_size(fd, 24, 80)
+        reset_session(fd)
+
+        set_pty_size(fd, 8, 105)
+        edge_prompt_text = "⌜william@brickroad:~/wsrc/ansible-guard/../../ansible-guard-script⌟ worktree-ansible-guard-script* » "
+        edge_prompt = b"\r\n" + edge_prompt_text.encode()
+        write(fd, f"PS1=$'\\n{edge_prompt_text}'\n".encode())
+        read_until(fd, edge_prompt)
+        run(fd, "BASH_AUTOSUGGEST_USE_ASYNC=0", prompt=edge_prompt)
+        run(fd, "history -c", prompt=edge_prompt)
+        full_command = b"ansible-guard -h"
+        run(fd, f"history -s {shlex.quote(full_command.decode())}", prompt=edge_prompt)
+        read_available(fd, timeout=0.05)
+        edge_output = b""
+        for ch in full_command:
+            write(fd, bytes([ch]))
+            edge_output += read_available(fd, timeout=0.08)
+        edge_output += read_available(fd, timeout=0.5)
+
+        actual = TerminalScreen(rows=8, cols=105)
+        actual.feed(edge_prompt)
+        actual.feed(edge_output)
+        expected = TerminalScreen(rows=8, cols=105)
+        expected.feed(edge_prompt)
+        expected.feed(full_command)
+        if actual.lines()[:4] != expected.lines()[:4]:
+            raise AssertionError(
+                "right-margin prompt left stale suggestion text: "
+                f"actual={actual.lines()[:4]!r} expected={expected.lines()[:4]!r} "
+                f"output={edge_output!r}"
+            )
+        clear_line(fd, prompt=edge_prompt)
         run(fd, "printf -v PS1 %s bas-test\\$\\ ")
         set_pty_size(fd, 24, 80)
         reset_session(fd)

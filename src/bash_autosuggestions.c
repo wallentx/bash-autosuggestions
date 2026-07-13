@@ -40,6 +40,7 @@ static int bas_installed;
 static int bas_enabled = 1;
 static int bas_in_redisplay;
 static int bas_drawn_rows = -1;
+static int bas_drawn_end_row;
 
 static char *bas_suggestion;
 static char *bas_suffix;
@@ -992,23 +993,6 @@ static int bas_at_accept_position(void) {
   return rl_point == rl_end || (bas_in_vi_movement() && rl_point == rl_end - 1);
 }
 
-static int bas_columns_to_end(void) {
-  if (!rl_line_buffer || rl_point >= rl_end) {
-    return 0;
-  }
-
-  int cols = 0;
-  for (int i = rl_point; i < rl_end; i++) {
-    unsigned char c = (unsigned char)rl_line_buffer[i];
-    if (c == '\n' || c == '\r') {
-      cols = 0;
-    } else if (c >= 0x20 && c != 0x7f) {
-      cols++;
-    }
-  }
-  return cols;
-}
-
 static int bas_screen_columns(void) {
   int rows = 0;
   int cols = 0;
@@ -1082,12 +1066,14 @@ static int bas_advance_cell(int *col, int screen_cols, unsigned char c) {
   return 0;
 }
 
-static int bas_prompt_column(void) {
-  const char *prompt = rl_display_prompt ? rl_display_prompt : rl_prompt;
-  int col = 0;
+static void bas_prompt_position(int *row, int *col) {
+  const char *prompt = rl_prompt ? rl_prompt : rl_display_prompt;
   int hidden = 0;
   int screen_cols = bas_screen_columns();
   size_t prompt_len = prompt ? strlen(prompt) : 0;
+
+  *row = 0;
+  *col = 0;
 
   for (size_t i = 0; prompt && i < prompt_len;) {
     unsigned char c = (unsigned char)prompt[i];
@@ -1117,7 +1103,7 @@ static int bas_prompt_column(void) {
       continue;
     }
     if (c == '\n' || c == '\r' || c == '\b' || c == '\t') {
-      bas_advance_cell(&col, screen_cols, c);
+      *row += bas_advance_cell(col, screen_cols, c);
       i++;
       continue;
     }
@@ -1126,33 +1112,36 @@ static int bas_prompt_column(void) {
     if (used == 0) {
       break;
     }
-    bas_advance_cells(&col, screen_cols, cells);
+    *row += bas_advance_cells(col, screen_cols, cells);
     i += used;
   }
-
-  return col;
 }
 
-static int bas_line_end_column(void) {
-  int col = bas_prompt_column();
+static void bas_line_position(int end, int *row, int *col) {
+  bas_prompt_position(row, col);
   int screen_cols = bas_screen_columns();
 
-  for (int i = 0; rl_line_buffer && i < rl_end;) {
+  for (int i = 0; rl_line_buffer && i < end;) {
     unsigned char c = (unsigned char)rl_line_buffer[i];
     if (c == '\n' || c == '\r' || c == '\b' || c == '\t') {
-      bas_advance_cell(&col, screen_cols, c);
+      *row += bas_advance_cell(col, screen_cols, c);
       i++;
       continue;
     }
     int cells = 0;
-    size_t used = bas_char_cells(rl_line_buffer + i, (size_t)(rl_end - i), &cells);
+    size_t used = bas_char_cells(rl_line_buffer + i, (size_t)(end - i), &cells);
     if (used == 0) {
       break;
     }
-    bas_advance_cells(&col, screen_cols, cells);
+    *row += bas_advance_cells(col, screen_cols, cells);
     i += (int)used;
   }
+}
 
+static int bas_line_end_column(void) {
+  int row = 0;
+  int col = 0;
+  bas_line_position(rl_end, &row, &col);
   return col;
 }
 
@@ -1181,12 +1170,13 @@ static int bas_suffix_rows(const char *suffix) {
   return rows;
 }
 
-static int bas_move_to_suggestion_start(FILE *out) {
-  int offset = bas_columns_to_end();
-  if (offset > 0) {
-    fprintf(out, "\033[%dC", offset);
+static void bas_move_cursor(FILE *out, int from_row, int to_row, int to_col) {
+  if (to_row < from_row) {
+    fprintf(out, "\033[%dA", from_row - to_row);
+  } else if (to_row > from_row) {
+    fprintf(out, "\033[%dB", to_row - from_row);
   }
-  return offset;
+  fprintf(out, "\033[%dG", to_col + 1);
 }
 
 static void bas_clear_drawn_suggestion(FILE *out) {
@@ -1194,15 +1184,23 @@ static void bas_clear_drawn_suggestion(FILE *out) {
     return;
   }
 
-  fputs("\033[s", out);
-  bas_move_to_suggestion_start(out);
-  for (int row = 0; row <= bas_drawn_rows; row++) {
-    fputs("\033[K", out);
-    if (row < bas_drawn_rows) {
-      fputs("\033[B\r", out);
+  int cursor_row = 0;
+  int cursor_col = 0;
+  int clear_row = 0;
+  int clear_col = 0;
+  bas_line_position(rl_point, &cursor_row, &cursor_col);
+  bas_line_position(rl_end, &clear_row, &clear_col);
+  if (clear_row <= bas_drawn_end_row) {
+    int clear_rows = bas_drawn_end_row - clear_row;
+    bas_move_cursor(out, cursor_row, clear_row, clear_col);
+    for (int row = 0; row <= clear_rows; row++) {
+      fputs("\033[K", out);
+      if (row < clear_rows) {
+        fputs("\033[B\r", out);
+      }
     }
+    bas_move_cursor(out, clear_row + clear_rows, cursor_row, cursor_col);
   }
-  fputs("\033[u", out);
   bas_drawn_rows = -1;
 }
 
@@ -1221,13 +1219,19 @@ static void bas_draw_suggestion(void) {
 
   char style[160];
   bas_style_sequence(style, sizeof(style));
+  int cursor_row = 0;
+  int cursor_col = 0;
+  int suggestion_row = 0;
+  int suggestion_col = 0;
+  bas_line_position(rl_point, &cursor_row, &cursor_col);
+  bas_line_position(rl_end, &suggestion_row, &suggestion_col);
   bas_drawn_rows = bas_suffix_rows(bas_suffix);
-  fputs("\033[s", out);
-  bas_move_to_suggestion_start(out);
+  bas_drawn_end_row = suggestion_row + bas_drawn_rows;
+  bas_move_cursor(out, cursor_row, suggestion_row, suggestion_col);
   fputs(style, out);
   fputs(bas_suffix, out);
   fputs("\033[0m", out);
-  fputs("\033[u", out);
+  bas_move_cursor(out, bas_drawn_end_row, cursor_row, cursor_col);
   fflush(out);
 }
 
